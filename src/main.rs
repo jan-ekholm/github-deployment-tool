@@ -1,8 +1,9 @@
+use hmac::{Hmac, Mac};
 use serde::Deserialize;
+use sha2::Sha256;
 use std::collections::HashMap;
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
+use std::process::{Command, exit};
 use tiny_http::{Response, Server};
 
 #[derive(Deserialize)]
@@ -24,7 +25,10 @@ pub struct Config {
     repo_name: String,
     branch_name: String,
     build_script: PathBuf,
+    webhook_secret: String,
 }
+
+const VERSION: &str = "1.0";
 
 fn build(config: &Config) -> Result<(), String> {
     println!(
@@ -44,7 +48,27 @@ fn build(config: &Config) -> Result<(), String> {
         ));
     }
 
+    println!(
+        "building succeeded for repo {}, script: {}",
+        config.repo_name,
+        config.build_script.display()
+    );
+
     Ok(())
+}
+
+fn validate_signature(secret: &[u8], body: &[u8], header: Option<&str>) -> bool {
+    let Some(hex_sig) = header.and_then(|h| h.strip_prefix("sha256=")) else {
+        return false;
+    };
+
+    let Ok(expected) = hex::decode(hex_sig) else {
+        return false;
+    };
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(body);
+    mac.verify_slice(&expected).is_ok()
 }
 
 fn header<'a>(request: &'a tiny_http::Request, name: &'static str) -> Option<&'a str> {
@@ -57,10 +81,7 @@ fn header<'a>(request: &'a tiny_http::Request, name: &'static str) -> Option<&'a
 
 fn serve(config: &Config) -> Result<(), String> {
     let server = Server::http(("0.0.0.0", config.port)).map_err(|e| e.to_string())?;
-    println!(
-        "listening for incoming GitHub events on port {}",
-        config.port
-    );
+    println!("listening for incoming GitHub events");
 
     loop {
         for mut request in server.incoming_requests() {
@@ -77,9 +98,21 @@ fn serve(config: &Config) -> Result<(), String> {
                 body.len()
             );
 
+            if !validate_signature(
+                config.webhook_secret.as_bytes(),
+                &body,
+                header(&request, "X-Hub-Signature-256"),
+            ) {
+                eprintln!("rejected request with bad signature");
+                let _ =
+                    request.respond(Response::from_string("bad signature").with_status_code(401));
+                continue;
+            }
+
             match header(&request, "X-GitHub-Event") {
                 Some("push") => {}
                 Some("ping") => {
+                    println!("received a ping, sending pong");
                     let _ = request.respond(Response::from_string("pong"));
                     continue;
                 }
@@ -99,17 +132,33 @@ fn serve(config: &Config) -> Result<(), String> {
                 }
             };
 
-            println!(
-                "push event received for {}, ref: {}",
-                event.repository.full_name, event.git_ref
-            );
+            println!("push event received for {}, branch: {}", event.repository.full_name, event.git_ref);
+
+            if event.repository.full_name != config.repo_name {
+                println!(
+                    "wrong repository name: {}, expected: {}",
+                    event.repository.full_name, config.repo_name
+                );
+                let _ = request.respond(Response::from_string("not our repository"));
+                continue;
+            }
 
             let wanted_ref = format!("refs/heads/{}", config.branch_name);
-            if event.repository.full_name != config.repo_name || event.git_ref != wanted_ref {
+            if event.git_ref != wanted_ref {
+                println!(
+                    "wrong branch name: {}, expected: {}",
+                    event.git_ref, wanted_ref
+                );
                 let _ = request.respond(Response::from_string("not our branch"));
                 continue;
             }
 
+            // got this far so the push was fine, let GitHub know
+            _ = request.respond(Response::new_empty(tiny_http::StatusCode(200)));
+            println!("sent response: 200 ok");
+
+            // do the build. It can fail but a failure to build does not affect the status code we
+            // send back to GitHub
             build(&config)?;
         }
     }
@@ -118,11 +167,30 @@ fn serve(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
+fn usage() {
+    let app_name = std::env::args().next().unwrap();
+    println!("Usage: {} options", app_name);
+    println!("Options:");
+    println!("    --port <port>           - the port number to bind to");
+    println!("    --repo_name <repo>      - the name of the repository to watch");
+    println!("    --branch <branch>       - the name of the branch in the repository");
+    println!("    --build_script <script> - full path to the script that performs the build");
+    println!("    --help                  - this help text");
+    println!();
+    println!("Additionally the environment variable WEBHOOK_SECRET must be set");
+
+    exit(0)
+}
+
 fn parse_commandline() -> Result<HashMap<String, String>, String> {
     let mut map: HashMap<String, String> = HashMap::new();
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
+        if arg == "--help" || arg == "-h" {
+            usage()
+        }
+
         let key = arg
             .strip_prefix("--")
             .ok_or_else(|| format!("expected --key, got {arg:?}"))?;
@@ -163,16 +231,27 @@ fn parse_config() -> Result<Config, String> {
         .canonicalize()
         .map_err(|e| format!("--build_script {}: {e}", build_script.display()))?;
 
+    let webhook_secret = match std::env::var("WEBHOOK_SECRET") {
+        Ok(s) => s,
+        Err(_) => return Err("WEBHOOK_SECRET environment variable not set".to_string()),
+    };
+
+    println!("incoming port: {}", port);
+    println!("repository:    {}", repo_name);
+    println!("branch name:   {}", branch_name);
+    println!("build script:  {}", build_script.display());
+
     Ok(Config {
         repo_name,
         port,
         branch_name,
         build_script,
+        webhook_secret,
     })
 }
 
 fn main() {
-    println!("GitHub deployment tool!");
+    println!("GitHub deployment tool {}", VERSION);
 
     match parse_config() {
         Ok(config) => match serve(&config) {
@@ -180,7 +259,7 @@ fn main() {
             _ => {}
         },
         Err(error) => {
-            println!("Failed to parse commandline: {error}");
+            println!("Failed to setup config: {error}");
         }
     }
 }
