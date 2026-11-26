@@ -1,0 +1,23 @@
+[Unit]
+Description=GitHub webhook deployment tool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/srv/myapp
+EnvironmentFile=/etc/github-deploy/env
+ExecStart=/usr/local/bin/github-deployment-tool \
+    --name myapp \
+    --repo janekholm/myapp \
+    --branch main \
+    --repo_dir /srv/myapp \
+    --build_script /srv/myapp/build.sh \
+    --port 8080
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
